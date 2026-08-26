@@ -404,21 +404,21 @@ class MMAudioSampler:
             clip_frames = None
             sync_frames = None
 
-        # 3) Update model to EXPECT these token lengths
-        net.update_seq_lengths(
-            seq_cfg.latent_seq_len,      # audio latents (comes from audio cfg/rate)
-            target_clip_tokens,          # CLIP tokens
-            target_sync_tokens           # SYNC tokens
-        )
-
-        # 4) Scheduler + JIT device placement with ComfyUI memory preparation
+        # 3) Scheduler + JIT device placement with ComfyUI memory preparation
         scheduler = FlowMatching(min_sigma=0, inference_mode='euler', num_steps=steps)
         if patchers_to_load:
             mm.load_models_gpu(patchers_to_load)
         else:
             mm.free_memory(2000 * 1024 * 1024, device)
-            feature_utils.to(device)
-            net.to(device)
+        feature_utils.to(device)
+        net.to(device)
+
+        # 4) Update model to EXPECT these token lengths (now on target device)
+        net.update_seq_lengths(
+            seq_cfg.latent_seq_len,      # audio latents (comes from audio cfg/rate)
+            target_clip_tokens,          # CLIP tokens
+            target_sync_tokens           # SYNC tokens
+        )
 
         try:
             # 5) Generate
@@ -436,16 +436,11 @@ class MMAudioSampler:
         finally:
             # 6) Automatic Offload based on ComfyUI's vram_state (offloads unless HIGH_VRAM is forced)
             if mm.vram_state != mm.VRAMState.HIGH_VRAM:
+                net.to(offload_device)
+                feature_utils.to(offload_device)
                 if patchers_to_load:
                     for p in patchers_to_load:
-                        p.model.to(p.offload_device)
-                        # Reset tracking counter so load_models_gpu reloads properly on next call.
-                        # Without this, partially_load() sees model_loaded_weight_memory > 0 and
-                        # returns early thinking the model is already on GPU.
                         p.model.model_loaded_weight_memory = 0
-                else:
-                    net.to(offload_device)
-                    feature_utils.to(offload_device)
                 mm.soft_empty_cache()
 
         waveform = audios.float().cpu()

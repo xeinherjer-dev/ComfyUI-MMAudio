@@ -70,9 +70,8 @@ def generate(clip_video: Optional[torch.Tensor],
     x0 = torch.randn(bs,
                      net.latent_seq_len,
                      net.latent_dim,
-                     device=net_device,
-                     dtype=net_dtype,
-                     generator=rng)
+                     device=rng.device,
+                     generator=rng).to(device=net_device, dtype=net_dtype)
     preprocessed_conditions = net.preprocess_conditions(clip_features, sync_features, text_features)
     empty_conditions = net.get_empty_conditions(
         bs, negative_text_features=negative_text_features if negative_text is not None else None)
