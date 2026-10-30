@@ -37,14 +37,17 @@ def process_video_tensor(
     target_device: torch.device | None = None,
     crop_mode: str = "crop",
     crop_position: str = "center",
+    loop_video: str = "loop",
+    video_fps: float = 24.0,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """
     Prepare visual tensors for MMAudio with extreme VRAM efficiency and flexible ROI:
     - Selects only the required frames on host memory (CPU) before pushing to GPU.
     - Prevents transferring giant video tensors (e.g. 2048x1152x320 ≈ 9GB) all at once.
     - Performs batched GPU resizing in micro-chunks so peak VRAM is kept under ~350MB.
-    - Supports crop_mode ("crop", "pad", "stretch") and crop_position ("center", "top", "bottom", "left", "right")
-      to perfectly capture faces/mouths (lip-sync) or lower body action/thrusting.
+    - Supports crop_mode ("crop", "pad", "stretch") and crop_position ("center", "top", "bottom", "left", "right").
+    - Supports loop_video ("loop", "pingpong", "none") with video_fps to maintain 1.0x native playback speed
+      and continue generating audio seamlessly when audio duration > input video length.
     """
     _CLIP_SIZE = 384
     _CLIP_FPS  = 8.0
@@ -68,16 +71,35 @@ def process_video_tensor(
     if target_sync is None:
         target_sync = max(1, int(_SYNC_FPS * duration_sec) - _SYNC_OFFSET)
 
-    # 1. Compute indices on source device without loading full video to GPU
-    def uniform_indices(n_src: int, n_tgt: int, device: torch.device) -> torch.Tensor:
+    # 1. Compute indices on source device with looping support
+    def compute_frame_indices(n_src: int, n_tgt: int, duration: float, fps: float, loop: str, device: torch.device) -> torch.Tensor:
         if n_src == 1:
             return torch.zeros(n_tgt, dtype=torch.long, device=device)
-        idx = torch.linspace(0, n_src - 1, steps=n_tgt, device=device)
-        return torch.round(idx).to(torch.long).clamp_(0, n_src - 1)
 
-    clip_idx = uniform_indices(total_frames, target_clip, video_tensor.device)
+        if loop == "none":
+            # Traditional stretch (full input video span is stretched/compressed to duration)
+            idx = torch.linspace(0, n_src - 1, steps=n_tgt, device=device)
+            return torch.round(idx).to(torch.long).clamp_(0, n_src - 1)
+
+        # Real-time 1.0x progression using actual video FPS
+        t_steps = torch.linspace(0.0, float(duration), steps=n_tgt, device=device)
+        frame_progress = t_steps * float(fps)
+        frame_int = torch.round(frame_progress).to(torch.long)
+
+        if loop == "loop":
+            return frame_int % n_src
+        elif loop == "pingpong":
+            if n_src <= 1:
+                return torch.zeros(n_tgt, dtype=torch.long, device=device)
+            cycle = 2 * (n_src - 1)
+            rem = frame_int % cycle
+            return torch.where(rem < n_src, rem, cycle - rem)
+        else:
+            return frame_int.clamp_(0, n_src - 1)
+
+    clip_idx = compute_frame_indices(total_frames, target_clip, duration_sec, video_fps, loop_video, video_tensor.device)
     sync_raw_needed = max(_SYNC_NUM_FRAMES_PER_SEG, int(target_sync) + _SYNC_OFFSET)
-    sync_idx = uniform_indices(total_frames, sync_raw_needed, video_tensor.device)
+    sync_idx = compute_frame_indices(total_frames, sync_raw_needed, duration_sec, video_fps, loop_video, video_tensor.device)
 
     # 2. Extract ONLY the needed frames from source tensor (typically in CPU RAM)
     raw_clip_frames = video_tensor.index_select(0, clip_idx)
@@ -367,14 +389,16 @@ class MMAudioSampler:
                 "mmaudio_model": ("MMAUDIO_MODEL",),
                 "feature_utils": ("MMAUDIO_FEATUREUTILS",),
                 "duration": ("FLOAT", {"default": 8, "step": 0.01, "tooltip": "Duration of the audio in seconds"}),
+                "video_fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01, "tooltip": "Original playback frame rate (FPS) of the input video. Used when looping is enabled to calculate correct time progression."}),
                 "steps": ("INT", {"default": 20, "step": 1, "tooltip": "Number of steps to interpolate (15-20 is optimal for RK4)"}),
                 "cfg": ("FLOAT", {"default": 5.0, "step": 0.1, "tooltip": "Strength of the conditioning"}),
                 "solver": (["rk4", "midpoint", "heun", "euler"], {"default": "rk4", "tooltip": "ODE solver algorithm. 'rk4' is 4th-order (maximum fidelity), 'midpoint' and 'heun' are 2nd-order, 'euler' is 1st-order."}),
                 "cfg_rescale": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Rescales CFG velocity variance to prevent over-saturation, harsh distortion, and high-frequency artifacts (0.0 = disabled, 0.5-0.7 recommended)"}),
                 "cfg_decay": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Attenuates CFG strength as trajectory approaches data (t -> 1) to smooth breath tails and micro-details"}),
                 "shift": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1, "tooltip": "Flow matching time shift schedule factor (1.0 = standard linear)"}),
-                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center", "tooltip": "Focus area for video frames. 'top' focuses on face/mouth (ideal for lip-sync & moaning), 'bottom' focuses on lower body/thrusting action, 'center' is balanced."}),
-                "crop_mode": (["crop", "pad", "stretch"], {"default": "crop", "tooltip": "'crop' zooms to chosen area without black bars; 'pad' fits entire frame with black bars (both face and action visible); 'stretch' fits frame without bars by squeezing."}),
+                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center", "tooltip": "Focus area for video frames. 'top' focuses on upper frame (e.g. face / lip-sync), 'bottom' focuses on lower frame, 'center' is balanced."}),
+                "crop_mode": (["crop", "pad", "stretch"], {"default": "crop", "tooltip": "'crop' zooms to chosen area without black bars; 'pad' fits entire frame with black bars; 'stretch' fits frame without bars by squeezing."}),
+                "loop_video": (["loop", "none", "pingpong"], {"default": "loop", "tooltip": "If audio duration > video length, loop video to maintain 1.0x native playback speed. 'loop' repeats from start, 'pingpong' bounces back and forth, 'none' stretches video to duration."}),
                 "peak_normalize": ("BOOLEAN", {"default": True, "tooltip": "Safeguards against digital clipping (>0dBFS) by normalizing peak amplitudes to -0.5dBFS"}),
                 "mask_away_clip": ("BOOLEAN", {"default": False, "tooltip": "If true, the clip video will be masked away"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -393,7 +417,7 @@ class MMAudioSampler:
 
     def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip,
                solver="rk4", cfg_rescale=0.7, cfg_decay=0.10, shift=1.0, crop_position="center", crop_mode="crop",
-               peak_normalize=True, images=None):
+               loop_video="loop", video_fps=24.0, peak_normalize=True, images=None):
         """
         - Uses seq_cfg to derive the *token* lengths the model expects.
         - Resamples frames so CLIP tokens == seq_cfg.clip_seq_len,
@@ -401,6 +425,7 @@ class MMAudioSampler:
         - Calls update_seq_lengths with the SAME lengths to avoid asserts.
         - High-order ODE solvers (Midpoint, Heun, RK4) and CFG Rescale for enhanced audio fidelity.
         - Flexible ROI framing (crop_position: top/bottom/center, crop_mode: crop/pad/stretch).
+        - Real-time video looping (loop_video: loop/pingpong/none, video_fps) to maintain 1.0x native speed.
         - JIT-moves models to GPU; automatically offloads based on ComfyUI vram_state.
         """
         device = mm.get_torch_device()
@@ -445,12 +470,14 @@ class MMAudioSampler:
                 bool(mask_away_clip),
                 str(crop_position),
                 str(crop_mode),
+                str(loop_video),
+                round(float(video_fps), 3),
                 pixel_hash,
                 id(feature_utils)
             )
 
             if MMAudioSampler._VIDEO_CACHE_KEY == current_cache_key and MMAudioSampler._VIDEO_CACHE_DATA is not None:
-                log.info(f"MMAudio: Reusing cached video features [crop={crop_mode}/{crop_position}] (instant 0s skip!)")
+                log.info(f"MMAudio: Reusing cached video features [crop={crop_mode}/{crop_position}, loop={loop_video}] (instant 0s skip!)")
                 cached_clip_f, cached_sync_f = MMAudioSampler._VIDEO_CACHE_DATA
             else:
                 clip_frames, sync_frames, duration = process_video_tensor(
@@ -460,6 +487,8 @@ class MMAudioSampler:
                     target_device=device,
                     crop_mode=crop_mode,
                     crop_position=crop_position,
+                    loop_video=loop_video,
+                    video_fps=video_fps,
                 )
                 log.info(
                     f"Prepared visual streams: "
