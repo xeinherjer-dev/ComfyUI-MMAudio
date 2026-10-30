@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn.functional as F
 import json
 from torchvision.transforms import v2
 from accelerate.utils import set_module_tensor_to_device
@@ -34,12 +35,16 @@ def process_video_tensor(
     target_clip: int | None = None,
     target_sync: int | None = None,
     target_device: torch.device | None = None,
+    crop_mode: str = "crop",
+    crop_position: str = "center",
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """
-    Prepare visual tensors for MMAudio with extreme VRAM efficiency:
+    Prepare visual tensors for MMAudio with extreme VRAM efficiency and flexible ROI:
     - Selects only the required frames on host memory (CPU) before pushing to GPU.
     - Prevents transferring giant video tensors (e.g. 2048x1152x320 ≈ 9GB) all at once.
-    - Performs batched GPU resizing in micro-chunks so peak VRAM is kept under ~150MB.
+    - Performs batched GPU resizing in micro-chunks so peak VRAM is kept under ~350MB.
+    - Supports crop_mode ("crop", "pad", "stretch") and crop_position ("center", "top", "bottom", "left", "right")
+      to perfectly capture faces/mouths (lip-sync) or lower body action/thrusting.
     """
     _CLIP_SIZE = 384
     _CLIP_FPS  = 8.0
@@ -78,32 +83,74 @@ def process_video_tensor(
     raw_clip_frames = video_tensor.index_select(0, clip_idx)
     raw_sync_frames = video_tensor.index_select(0, sync_idx)
 
-    # 3. Micro-chunk GPU resizing to keep peak memory virtually zero
-    clip_transform = v2.Compose([
-        v2.Resize((_CLIP_SIZE, _CLIP_SIZE), interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
-        v2.ToDtype(torch.float32, scale=False if raw_clip_frames.dtype.is_floating_point else True),
-    ])
+    # 3. Flexible framing and resizing kernel
+    def transform_frames(chunk: torch.Tensor, target_size: int, is_sync: bool = False) -> torch.Tensor:
+        # chunk: (B, C, H, W) float32 on GPU
+        _, _, H, W = chunk.shape
 
-    sync_transform = v2.Compose([
-        v2.Resize(_SYNC_SIZE, interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
-        v2.CenterCrop(_SYNC_SIZE),
-        v2.ToDtype(torch.float32, scale=False if raw_sync_frames.dtype.is_floating_point else True),
-        v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
+        if crop_mode == "stretch":
+            out = v2.functional.resize(chunk, [target_size, target_size], interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
+        elif crop_mode == "pad":
+            scale = target_size / max(H, W)
+            new_H = max(1, round(H * scale))
+            new_W = max(1, round(W * scale))
+            resized = v2.functional.resize(chunk, [new_H, new_W], interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
+            pad_left = (target_size - new_W) // 2
+            pad_right = target_size - new_W - pad_left
+            pad_top = (target_size - new_H) // 2
+            pad_bottom = target_size - new_H - pad_top
+            out = F.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
+        else:  # crop
+            scale = target_size / min(H, W)
+            new_H = max(target_size, round(H * scale))
+            new_W = max(target_size, round(W * scale))
+            resized = v2.functional.resize(chunk, [new_H, new_W], interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
 
-    def chunked_process(frames_tensor: torch.Tensor, transform: v2.Compose, chunk_size: int = 16) -> torch.Tensor:
+            # Vertical crop anchor
+            diff_h = new_H - target_size
+            if diff_h > 0:
+                if crop_position == "top":
+                    start_h = 0
+                elif crop_position == "bottom":
+                    start_h = diff_h
+                else:  # center
+                    start_h = diff_h // 2
+            else:
+                start_h = 0
+
+            # Horizontal crop anchor
+            diff_w = new_W - target_size
+            if diff_w > 0:
+                if crop_position == "left":
+                    start_w = 0
+                elif crop_position == "right":
+                    start_w = diff_w
+                else:  # center
+                    start_w = diff_w // 2
+            else:
+                start_w = 0
+
+            out = resized[:, :, start_h : start_h + target_size, start_w : start_w + target_size]
+
+        if is_sync:
+            # Synchformer normalization: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5] -> [-1, 1]
+            out = (out - 0.5) / 0.5
+
+        return out
+
+    def chunked_process(frames_tensor: torch.Tensor, target_size: int, is_sync: bool, chunk_size: int = 16) -> torch.Tensor:
         processed_chunks = []
         n_frames = frames_tensor.shape[0]
         for start_i in range(0, n_frames, chunk_size):
             chunk = frames_tensor[start_i : start_i + chunk_size]
             # Send small chunk to GPU
-            chunk = chunk.to(device=target_device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
-            chunk = transform(chunk)
+            chunk = chunk.to(device=target_device, dtype=torch.float32, non_blocking=True).permute(0, 3, 1, 2).contiguous()
+            chunk = transform_frames(chunk, target_size=target_size, is_sync=is_sync)
             processed_chunks.append(chunk)
         return torch.cat(processed_chunks, dim=0)
 
-    clip_frames = chunked_process(raw_clip_frames, clip_transform, chunk_size=16)
-    sync_frames = chunked_process(raw_sync_frames, sync_transform, chunk_size=16)
+    clip_frames = chunked_process(raw_clip_frames, target_size=_CLIP_SIZE, is_sync=False, chunk_size=16)
+    sync_frames = chunked_process(raw_sync_frames, target_size=_SYNC_SIZE, is_sync=True, chunk_size=16)
 
     return clip_frames, sync_frames, duration_sec
 
@@ -326,6 +373,8 @@ class MMAudioSampler:
                 "cfg_rescale": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Rescales CFG velocity variance to prevent over-saturation, harsh distortion, and high-frequency artifacts (0.0 = disabled, 0.5-0.7 recommended)"}),
                 "cfg_decay": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Attenuates CFG strength as trajectory approaches data (t -> 1) to smooth breath tails and micro-details"}),
                 "shift": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1, "tooltip": "Flow matching time shift schedule factor (1.0 = standard linear)"}),
+                "crop_position": (["center", "top", "bottom", "left", "right"], {"default": "center", "tooltip": "Focus area for video frames. 'top' focuses on face/mouth (ideal for lip-sync & moaning), 'bottom' focuses on lower body/thrusting action, 'center' is balanced."}),
+                "crop_mode": (["crop", "pad", "stretch"], {"default": "crop", "tooltip": "'crop' zooms to chosen area without black bars; 'pad' fits entire frame with black bars (both face and action visible); 'stretch' fits frame without bars by squeezing."}),
                 "peak_normalize": ("BOOLEAN", {"default": True, "tooltip": "Safeguards against digital clipping (>0dBFS) by normalizing peak amplitudes to -0.5dBFS"}),
                 "mask_away_clip": ("BOOLEAN", {"default": False, "tooltip": "If true, the clip video will be masked away"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -343,13 +392,15 @@ class MMAudioSampler:
     CATEGORY = "MMAudio"
 
     def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip,
-               solver="rk4", cfg_rescale=0.7, cfg_decay=0.10, shift=1.0, peak_normalize=True, images=None):
+               solver="rk4", cfg_rescale=0.7, cfg_decay=0.10, shift=1.0, crop_position="center", crop_mode="crop",
+               peak_normalize=True, images=None):
         """
         - Uses seq_cfg to derive the *token* lengths the model expects.
         - Resamples frames so CLIP tokens == seq_cfg.clip_seq_len,
         and SYNC TOKENS == seq_cfg.sync_seq_len (by feeding +8 raw frames).
         - Calls update_seq_lengths with the SAME lengths to avoid asserts.
         - High-order ODE solvers (Midpoint, Heun, RK4) and CFG Rescale for enhanced audio fidelity.
+        - Flexible ROI framing (crop_position: top/bottom/center, crop_mode: crop/pad/stretch).
         - JIT-moves models to GPU; automatically offloads based on ComfyUI vram_state.
         """
         device = mm.get_torch_device()
@@ -382,7 +433,7 @@ class MMAudioSampler:
         current_cache_key = None
 
         if images is not None:
-            # Generate ultra-fast unique fingerprint (shape + duration + targets + sample pixel sum)
+            # Generate ultra-fast unique fingerprint (shape + duration + targets + crop + sample pixel sum)
             n_frames = images.shape[0]
             sample_pts = [0, n_frames // 4, n_frames // 2, (3 * n_frames) // 4, n_frames - 1]
             pixel_hash = float(images[sample_pts, :2, :2, :].sum().item())
@@ -392,12 +443,14 @@ class MMAudioSampler:
                 int(target_clip_tokens),
                 int(target_sync_tokens),
                 bool(mask_away_clip),
+                str(crop_position),
+                str(crop_mode),
                 pixel_hash,
                 id(feature_utils)
             )
 
             if MMAudioSampler._VIDEO_CACHE_KEY == current_cache_key and MMAudioSampler._VIDEO_CACHE_DATA is not None:
-                log.info("MMAudio: Reusing cached video features (instant 0s skip!)")
+                log.info(f"MMAudio: Reusing cached video features [crop={crop_mode}/{crop_position}] (instant 0s skip!)")
                 cached_clip_f, cached_sync_f = MMAudioSampler._VIDEO_CACHE_DATA
             else:
                 clip_frames, sync_frames, duration = process_video_tensor(
@@ -405,6 +458,8 @@ class MMAudioSampler:
                     target_clip=target_clip_tokens,
                     target_sync=target_sync_tokens,
                     target_device=device,
+                    crop_mode=crop_mode,
+                    crop_position=crop_position,
                 )
                 log.info(
                     f"Prepared visual streams: "
