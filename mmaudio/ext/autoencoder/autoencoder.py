@@ -33,8 +33,21 @@ class AutoEncoderModule(nn.Module):
 
     @torch.inference_mode()
     def decode(self, z: torch.Tensor) -> torch.Tensor:
+        try:
+            vae_dtype = next(self.vae.parameters()).dtype
+            if z.dtype != vae_dtype:
+                z = z.to(dtype=vae_dtype)
+        except StopIteration:
+            pass
         return self.vae.decode(z)
 
     @torch.inference_mode()
     def vocode(self, spec: torch.Tensor) -> torch.Tensor:
+        if self.vocoder is not None:
+            try:
+                voc_dtype = next(self.vocoder.parameters()).dtype
+                if spec.dtype != voc_dtype:
+                    spec = spec.to(dtype=voc_dtype)
+            except StopIteration:
+                pass
         return self.vocoder(spec)

@@ -335,14 +335,32 @@ class MMAudio(nn.Module):
         return conditions
 
     def ode_wrapper(self, t: torch.Tensor, latent: torch.Tensor, conditions: PreprocessedConditions,
-                    empty_conditions: PreprocessedConditions, cfg_strength: float) -> torch.Tensor:
+                    empty_conditions: PreprocessedConditions, cfg_strength: float,
+                    cfg_rescale: float = 0.0, cfg_decay: float = 0.0) -> torch.Tensor:
         t = t * torch.ones(len(latent), device=latent.device, dtype=latent.dtype)
 
-        if cfg_strength < 1.0:
-            return self.predict_flow(latent, t, conditions)
-        else:
-            return (cfg_strength * self.predict_flow(latent, t, conditions) +
-                    (1 - cfg_strength) * self.predict_flow(latent, t, empty_conditions))
+        v_cond = self.predict_flow(latent, t, conditions)
+        if cfg_strength <= 1.0:
+            return v_cond
+
+        # Dynamic CFG decay: optionally attenuate guidance near t -> 1 (data manifold)
+        current_cfg = cfg_strength
+        if cfg_decay > 0.0:
+            t_val = float(t[0].item()) if isinstance(t, torch.Tensor) else float(t)
+            current_cfg = max(1.0, cfg_strength * (1.0 - cfg_decay * (t_val ** 2)))
+
+        v_uncond = self.predict_flow(latent, t, empty_conditions)
+        v_cfg = v_uncond + current_cfg * (v_cond - v_uncond)
+
+        if cfg_rescale > 0.0:
+            # Rescale standard deviation to mitigate over-saturation and high-frequency distortion
+            std_cond = v_cond.std(dim=list(range(1, v_cond.ndim)), keepdim=True)
+            std_cfg = v_cfg.std(dim=list(range(1, v_cfg.ndim)), keepdim=True)
+            factor = std_cond / (std_cfg + 1e-8)
+            v_rescaled = v_cfg * factor
+            v_cfg = (1.0 - cfg_rescale) * v_cfg + cfg_rescale * v_rescaled
+
+        return v_cfg
 
     def load_weights(self, src_dict) -> None:
         if 't_embed.freqs' in src_dict:
